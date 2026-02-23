@@ -1,0 +1,15 @@
+{
+  "tools": [
+    {
+      "name": "fetch_profile",
+      "description": "Fetches caller profile from Twilio Memory",
+      "parameters": {
+        "phoneNumber": {
+          "type": "string",
+          "description": "The caller's phone number"
+        }
+      }
+    }
+  ],
+  "version": "1.0.0"
+}

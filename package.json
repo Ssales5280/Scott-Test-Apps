@@ -1,13 +1,23 @@
 {
-  "name": "sample-app",
+  "name": "twilio-voice-memory-app",
   "version": "1.0.0",
-  "description": "A sample Node.js application",
-  "main": "index.js",
+  "description": "Twilio voice application with Memory API integration",
+  "main": "server.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node index.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
   },
-  "keywords": ["sample", "app"],
+  "keywords": ["twilio", "voice", "memory", "openai"],
   "author": "Test User",
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "twilio": "^4.20.0",
+    "dotenv": "^16.3.1",
+    "openai": "^4.28.0",
+    "axios": "^1.6.7"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.3"
+  }
 }
