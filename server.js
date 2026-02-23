@@ -14,6 +14,10 @@ const accountSid = process.env.ACCOUNT_SID;
 const authToken = process.env.AUTH_TOKEN;
 const memStoreId = process.env.TWILIO_MEMORY_STORE_ID;
 
+// Segment credentials
+const segmentSpaceId = process.env.SEGMENT_SPACE_ID;
+const segmentProfileToken = process.env.SEGMENT_PROFILE_TOKEN;
+
 // OpenAI setup
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
@@ -22,6 +26,46 @@ const openai = new OpenAI({
 // Middleware
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+
+// Fetch profile from Segment
+async function fetchProfileFromSegment(phoneNumber) {
+  try {
+    const url = `https://profiles.segment.com/v1/spaces/${segmentSpaceId}/collections/users/profiles/user_id:${encodeURIComponent(phoneNumber)}/traits?limit=200`;
+    
+    console.log('\n========== SEGMENT PROFILE LOOKUP START ==========');
+    console.log(`Phone Number: ${phoneNumber}`);
+    console.log(`SEGMENT API URL: ${url}`);
+    console.log(`Space ID: ${segmentSpaceId}`);
+    
+    const response = await axios.get(url, {
+      headers: {
+        Authorization: `Basic ${Buffer.from(segmentProfileToken + ':').toString('base64')}`
+      }
+    });
+    
+    console.log('✅ Segment API Response Status:', response.status);
+    console.log('SEGMENT API RAW RESPONSE:', JSON.stringify(response.data, null, 2));
+    console.log('========== SEGMENT PROFILE LOOKUP END ==========\n');
+    
+    // Return traits in the expected format
+    const traits = response.data.traits || {};
+    if (Object.keys(traits).length > 0) {
+      return {
+        source: 'segment',
+        traits: traits
+      };
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('\n❌ ERROR FETCHING SEGMENT PROFILE');
+    console.error('Error Status:', error.response?.status);
+    console.error('Error Data:', JSON.stringify(error.response?.data, null, 2));
+    console.error('Error Message:', error.message);
+    console.error('========== SEGMENT PROFILE LOOKUP END ==========\n');
+    return null;
+  }
+}
 
 // Fetch profile from Twilio Memory
 async function fetchProfileFromMemory(phoneNumber) {
@@ -137,15 +181,21 @@ app.post('/voice', async (req, res) => {
   console.log(`Incoming call from: ${callerPhone}`);
   
   try {
-    // Fetch caller profile from Twilio Memory
-    const profile = await fetchProfileFromMemory(callerPhone);
+    // Fetch caller profile from Twilio Memory first, then try Segment as fallback
+    let profile = await fetchProfileFromMemory(callerPhone);
+    
+    // If no profile found in Twilio Memory, try Segment
+    if (!profile || !profile.traits) {
+      console.log('🔄 No profile from Twilio Memory, trying Segment...');
+      profile = await fetchProfileFromSegment(callerPhone);
+    }
     
     if (profile && profile.traits) {
       console.log('Profile retrieved successfully');
       
       // Extract traits for personalized greeting
-      const firstName = profile.traits.firstName || profile.traits.firstname || '';
-      const lastName = profile.traits.lastName || profile.traits.lastname || '';
+      const firstName = profile.traits.firstName || profile.traits.firstname || profile.traits.first_name || '';
+      const lastName = profile.traits.lastName || profile.traits.lastname || profile.traits.last_name || '';
       const address = profile.traits.address || '';
       
       // Build personalized greeting
@@ -199,7 +249,13 @@ app.post('/handle-input', async (req, res) => {
   try {
     // Load context and get OpenAI response
     const context = loadLLMContext();
-    const profile = await fetchProfileFromMemory(callerPhone);
+    let profile = await fetchProfileFromMemory(callerPhone);
+    
+    // If no profile found in Twilio Memory, try Segment as fallback
+    if (!profile || !profile.traits) {
+      console.log('🔄 No profile from Twilio Memory, trying Segment...');
+      profile = await fetchProfileFromSegment(callerPhone);
+    }
     
     const systemMessage = `${context}\n\nCaller Profile: ${JSON.stringify(profile || 'No profile found')}`;
     
