@@ -25,28 +25,81 @@ app.use(express.json());
 
 // Fetch profile from Twilio Memory
 async function fetchProfileFromMemory(phoneNumber) {
-  try {
-    const url = `https://memory.twilio.com/v1/Stores/${memStoreId}/Profiles/Lookup`;
-    
-    console.log(`Fetching profile for phone: ${phoneNumber}`);
-    
-    const response = await axios.get(url, {
-      params: {
-        idType: 'phone',
-        value: phoneNumber
-      },
-      auth: {
-        username: accountSid,
-        password: authToken
+  // Try both 'phone' and 'phoneNumber' as idType since they may be synonymous
+  const idTypes = ['phone', 'phoneNumber'];
+  
+  for (const idType of idTypes) {
+    try {
+      // Step 1: Lookup profile by phone number
+      const lookupUrl = `https://memory.twilio.com/v1/Stores/${memStoreId}/Profiles/Lookup`;
+      
+      console.log('\n========== PROFILE LOOKUP START ==========');
+      console.log(`Phone Number: ${phoneNumber}`);
+      console.log(`Lookup URL: ${lookupUrl}`);
+      console.log(`Query Params: idType=${idType}, value=${phoneNumber}`);
+      console.log(`Auth User: ${accountSid}`);
+      console.log(`Memory Store ID: ${memStoreId}`);
+      
+      const lookupResponse = await axios.get(lookupUrl, {
+        params: {
+          idType: idType,
+          value: phoneNumber
+        },
+        auth: {
+          username: accountSid,
+          password: authToken
+        }
+      });
+      
+      console.log('✅ Lookup API Response Status:', lookupResponse.status);
+      console.log('Lookup API Response Data:', JSON.stringify(lookupResponse.data, null, 2));
+      
+      // Step 2: Get the full profile with traits using profileId
+      if (lookupResponse.data && lookupResponse.data.profileId) {
+        const profileId = lookupResponse.data.profileId;
+        const profileUrl = `https://memory.twilio.com/v1/Stores/${memStoreId}/Profiles/${profileId}`;
+        
+        console.log('\n--- Fetching Full Profile ---');
+        console.log(`Profile ID: ${profileId}`);
+        console.log(`Profile URL: ${profileUrl}`);
+        
+        const profileResponse = await axios.get(profileUrl, {
+          auth: {
+            username: accountSid,
+            password: authToken
+          }
+        });
+        
+        console.log('✅ Profile API Response Status:', profileResponse.status);
+        console.log('Full Profile Data:', JSON.stringify(profileResponse.data, null, 2));
+        console.log('========== PROFILE LOOKUP END ==========\n');
+        return profileResponse.data;
       }
-    });
-    
-    console.log('Profile found:', response.data);
-    return response.data;
-  } catch (error) {
-    console.error('Error fetching profile:', error.response?.data || error.message);
-    return null;
+      
+      console.log('⚠️ No profileId found in lookup response - returning basic data');
+      console.log('========== PROFILE LOOKUP END ==========\n');
+      return lookupResponse.data;
+      
+    } catch (error) {
+      // If not found with this idType, try the next one
+      if (error.response?.status === 404 && idTypes.indexOf(idType) < idTypes.length - 1) {
+        console.log(`⚠️ Profile not found with idType="${idType}", trying next...`);
+        continue;
+      }
+      
+      // If it's the last idType or a different error, log and return null
+      console.error('\n❌ ERROR FETCHING PROFILE');
+      console.error('Error Status:', error.response?.status);
+      console.error('Error Data:', JSON.stringify(error.response?.data, null, 2));
+      console.error('Error Message:', error.message);
+      console.error('========== PROFILE LOOKUP END ==========\n');
+      return null;
+    }
   }
+  
+  console.log('⚠️ Profile not found with any idType');
+  console.log('========== PROFILE LOOKUP END ==========\n');
+  return null;
 }
 
 // Load context and manifest files
@@ -87,15 +140,29 @@ app.post('/voice', async (req, res) => {
     // Fetch caller profile from Twilio Memory
     const profile = await fetchProfileFromMemory(callerPhone);
     
-    if (profile) {
+    if (profile && profile.traits) {
       console.log('Profile retrieved successfully');
       
-      // Store profile in session or use it for personalization
-      const greeting = `Welcome back! We found your profile.`;
-      twiml.say({ voice: 'Polly.Joanna' }, greeting);
+      // Extract traits for personalized greeting
+      const firstName = profile.traits.firstName || profile.traits.firstname || '';
+      const lastName = profile.traits.lastName || profile.traits.lastname || '';
+      const address = profile.traits.address || '';
       
-      // You can now use the profile data with OpenAI or other services
-      // Example: twiml.redirect('/conversation?profileId=' + profile.id);
+      // Build personalized greeting
+      let greeting = 'Welcome back';
+      if (firstName) {
+        greeting += ` ${firstName}`;
+        if (lastName) {
+          greeting += ` ${lastName}`;
+        }
+      }
+      greeting += '!';
+      
+      if (address) {
+        greeting += ` We have you on record at ${address}.`;
+      }
+      
+      twiml.say({ voice: 'Polly.Joanna' }, greeting);
     } else {
       console.log('No profile found for caller');
       twiml.say({ voice: 'Polly.Joanna' }, 'Welcome! We couldn\'t find your profile.');
