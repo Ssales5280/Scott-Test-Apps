@@ -1,12 +1,19 @@
 {
   "tools": [
     {
-      "name": "fetch_profile",
-      "description": "Fetches caller profile from Twilio Memory",
-      "parameters": {
-        "phoneNumber": {
-          "type": "string",
-          "description": "The caller's phone number"
+      "type": "function",
+      "function": {
+        "name": "send_text_message",
+        "description": "Send an SMS text message to the caller's phone number. Use this when the caller requests information to be sent via text, needs a confirmation, or asks for a follow-up message.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string",
+              "description": "The text message content to send to the caller"
+            }
+          },
+          "required": ["message"]
         }
       }
     }

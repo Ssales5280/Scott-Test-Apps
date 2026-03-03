@@ -13,6 +13,7 @@ const PORT = process.env.PORT || 3001;
 const accountSid = process.env.ACCOUNT_SID;
 const authToken = process.env.AUTH_TOKEN;
 const memStoreId = process.env.TWILIO_MEMORY_STORE_ID;
+const twilioPhoneNumber = process.env.TWILIO_PHONE_NUMBER;
 
 // Segment credentials
 const segmentSpaceId = process.env.SEGMENT_SPACE_ID;
@@ -23,9 +24,62 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
+// In-memory conversation history keyed by Twilio CallSid
+const conversationHistory = new Map();
+
 // Middleware
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+
+// Send SMS using Twilio Messaging API
+async function sendTextMessage(toPhoneNumber, messageBody) {
+  try {
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`;
+    
+    console.log('\n========== SENDING SMS ==========');
+    console.log(`To: ${toPhoneNumber}`);
+    console.log(`From: ${twilioPhoneNumber}`);
+    console.log(`Message: ${messageBody}`);
+    
+    const response = await axios.post(url, 
+      new URLSearchParams({
+        To: toPhoneNumber,
+        From: twilioPhoneNumber,
+        Body: messageBody
+      }), 
+      {
+        auth: {
+          username: accountSid,
+          password: authToken
+        },
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded'
+        }
+      }
+    );
+    
+    console.log('✅ SMS sent successfully');
+    console.log('Message SID:', response.data.sid);
+    console.log('========== SMS SENT ==========\n');
+    
+    return {
+      success: true,
+      messageSid: response.data.sid,
+      status: response.data.status
+    };
+  } catch (error) {
+    console.error('\n❌ ERROR SENDING SMS');
+    console.error('Error Status:', error.response?.status);
+    console.error('Error Data:', JSON.stringify(error.response?.data, null, 2));
+    console.error('Error Message:', error.message);
+    console.error('========== SMS FAILED ==========\n');
+    
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+}
 
 // Fetch profile from Segment
 async function fetchProfileFromSegment(phoneNumber) {
@@ -171,71 +225,74 @@ function loadToolManifest() {
 app.post('/voice', async (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const callerPhone = req.body.From;
-  
-  console.log(`Incoming call from: ${callerPhone}`);
-  
+  const callSid = req.body.CallSid;
+
+  console.log(`Incoming call from: ${callerPhone} (CallSid: ${callSid})`);
+
   try {
     // Fetch caller profile from Twilio Memory first, then try Segment as fallback
     let profile = await fetchProfileFromMemory(callerPhone);
-    
+
     // If no profile found in Twilio Memory, try Segment
     if (!profile || !profile.traits) {
       console.log('🔄 No profile from Twilio Memory, trying Segment...');
       profile = await fetchProfileFromSegment(callerPhone);
     }
-    
-    if (profile && profile.traits) {
-      console.log('Profile retrieved successfully');
-      
-      // Extract traits for personalized greeting
-      // Check for nested Contact object (Twilio Memory format) or direct traits (Segment format)
-      const contact = profile.traits.Contact || profile.traits;
-      const firstName = contact.firstName || contact.firstname || contact.first_name || '';
-      const lastName = contact.lastName || contact.lastname || contact.last_name || '';
-      const street = contact.street || contact.address || '';
-      const city = contact.city || '';
-      const state = contact.state || '';
-      
-      // Build personalized greeting
-      let greeting = 'Welcome back';
-      if (firstName) {
-        greeting += ` ${firstName}`;
-        if (lastName) {
-          greeting += ` ${lastName}`;
-        }
-      }
-      greeting += '!';
-      
-      if (street) {
-        greeting += ` We have you on record at ${street}`;
-        if (city) {
-          greeting += ` in ${city}`;
-        }
-        greeting += '.';
-      }
-      
-      twiml.say({ voice: 'Polly.Joanna' }, greeting);
-    } else {
-      console.log('No profile found for caller');
-      twiml.say({ voice: 'Polly.Joanna' }, 'Welcome! We couldn\'t find your profile.');
-    }
-    
-    // Add menu or next steps
+
+    // Build system message and let the LLM generate a natural greeting
+    const context = loadLLMContext();
+    const systemMessage = `${context}\n\nCaller Profile: ${JSON.stringify(profile || 'No profile found')}\n\nCaller Phone: ${callerPhone}`;
+
+    const greetingPrompt = profile && profile.traits
+      ? 'The caller just connected. Generate a warm, personalized greeting using their profile information. Then ask how you can help. Keep it to 2-3 sentences for a phone conversation.'
+      : 'A new caller just connected and we don\'t have a profile on file for them. Greet them warmly and ask how you can help. Keep it to 1-2 sentences.';
+
+    const messages = [
+      { role: 'system', content: systemMessage },
+      { role: 'user', content: greetingPrompt }
+    ];
+
+    const completion = await openai.chat.completions.create({
+      model: process.env.OPENAI_MODEL || 'gpt-4o',
+      messages: messages
+    });
+
+    const greetingResponse = completion.choices[0].message.content;
+    console.log(`LLM greeting: ${greetingResponse}`);
+
+    // Initialize conversation history for this call
+    conversationHistory.set(callSid, {
+      systemMessage: systemMessage,
+      messages: [
+        { role: 'user', content: greetingPrompt },
+        { role: 'assistant', content: greetingResponse }
+      ],
+      profile: profile
+    });
+
+    // Speak the LLM-generated greeting and immediately listen for response
     const gather = twiml.gather({
       input: 'speech dtmf',
       action: '/handle-input',
       method: 'POST',
-      timeout: 3,
+      timeout: 5,
       speechTimeout: 'auto'
     });
-    
-    gather.say({ voice: 'Polly.Joanna' }, 'How can I help you today?');
-    
+
+    gather.say(greetingResponse);
+
   } catch (error) {
     console.error('Error in voice handler:', error);
-    twiml.say({ voice: 'Polly.Joanna' }, 'Sorry, we encountered an error. Please try again.');
+    const gather = twiml.gather({
+      input: 'speech dtmf',
+      action: '/handle-input',
+      method: 'POST',
+      timeout: 5,
+      speechTimeout: 'auto'
+    });
+    gather.say('Thank you for calling GrubHub. How can I help you today?');
   }
-  
+
   res.type('text/xml');
   res.send(twiml.toString());
 });
@@ -245,57 +302,134 @@ app.post('/handle-input', async (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const userInput = req.body.SpeechResult || req.body.Digits;
   const callerPhone = req.body.From;
-  
-  console.log(`User input: ${userInput}`);
-  
+  const callSid = req.body.CallSid;
+
+  console.log(`User input (CallSid: ${callSid}): ${userInput}`);
+
   try {
-    // Load context and get OpenAI response
-    const context = loadLLMContext();
-    let profile = await fetchProfileFromMemory(callerPhone);
-    
-    // If no profile found in Twilio Memory, try Segment as fallback
-    if (!profile || !profile.traits) {
-      console.log('🔄 No profile from Twilio Memory, trying Segment...');
-      profile = await fetchProfileFromSegment(callerPhone);
+    // Retrieve or initialize conversation history for this call
+    let session = conversationHistory.get(callSid);
+
+    if (!session) {
+      // Session not found (edge case) — rebuild context
+      const context = loadLLMContext();
+      let profile = await fetchProfileFromMemory(callerPhone);
+      if (!profile || !profile.traits) {
+        profile = await fetchProfileFromSegment(callerPhone);
+      }
+      const systemMessage = `${context}\n\nCaller Profile: ${JSON.stringify(profile || 'No profile found')}\n\nCaller Phone: ${callerPhone}`;
+      session = { systemMessage, messages: [], profile };
+      conversationHistory.set(callSid, session);
     }
-    
-    const systemMessage = `${context}\n\nCaller Profile: ${JSON.stringify(profile || 'No profile found')}`;
-    
+
+    // Add the caller's latest input to conversation history
+    session.messages.push({ role: 'user', content: userInput });
+
+    // Load available tools
+    const toolManifest = loadToolManifest();
+    const tools = toolManifest.tools || [];
+
+    // Build the full message array: system + conversation history
+    const apiMessages = [
+      { role: 'system', content: session.systemMessage },
+      ...session.messages
+    ];
+
     const completion = await openai.chat.completions.create({
       model: process.env.OPENAI_MODEL || 'gpt-4o',
-      messages: [
-        { role: 'system', content: systemMessage },
-        { role: 'user', content: userInput }
-      ]
+      messages: apiMessages,
+      tools: tools.length > 0 ? tools : undefined,
+      tool_choice: tools.length > 0 ? 'auto' : undefined
     });
-    
-    const aiResponse = completion.choices[0].message.content;
-    
-    twiml.say({ voice: 'Polly.Joanna' }, aiResponse);
-    
-    // Continue conversation
+
+    let assistantMessage = completion.choices[0].message;
+
+    // Handle tool calls — execute and feed results back to the LLM
+    if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0) {
+      // Store the assistant's tool-call message in history
+      session.messages.push(assistantMessage);
+
+      // Execute each tool call and collect results
+      for (const toolCall of assistantMessage.tool_calls) {
+        const functionName = toolCall.function.name;
+        const functionArgs = JSON.parse(toolCall.function.arguments);
+
+        console.log(`AI requested function: ${functionName}`, functionArgs);
+
+        let toolResult;
+        if (functionName === 'send_text_message') {
+          const result = await sendTextMessage(callerPhone, functionArgs.message);
+          toolResult = result.success
+            ? `Text message sent successfully to ${callerPhone}.`
+            : `Failed to send text message: ${result.error}`;
+        } else {
+          toolResult = `Unknown function: ${functionName}`;
+        }
+
+        // Add the tool result to conversation history
+        session.messages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: toolResult
+        });
+      }
+
+      // Send the conversation back to the LLM so it can generate a natural response
+      const followUp = await openai.chat.completions.create({
+        model: process.env.OPENAI_MODEL || 'gpt-4o',
+        messages: [
+          { role: 'system', content: session.systemMessage },
+          ...session.messages
+        ]
+      });
+
+      assistantMessage = followUp.choices[0].message;
+    }
+
+    // Store the assistant's final response in history
+    const aiResponse = assistantMessage.content;
+    session.messages.push({ role: 'assistant', content: aiResponse });
+
+    console.log(`LLM response: ${aiResponse}`);
+
+    // Speak the LLM response and listen for the next input
     const gather = twiml.gather({
       input: 'speech dtmf',
       action: '/handle-input',
       method: 'POST',
-      timeout: 3,
+      timeout: 5,
       speechTimeout: 'auto'
     });
-    
-    gather.say({ voice: 'Polly.Joanna' }, 'Is there anything else?');
-    
+
+    gather.say(aiResponse);
+
   } catch (error) {
     console.error('Error handling input:', error);
-    twiml.say({ voice: 'Polly.Joanna' }, 'Sorry, I didn\'t understand that.');
+    const gather = twiml.gather({
+      input: 'speech dtmf',
+      action: '/handle-input',
+      method: 'POST',
+      timeout: 5,
+      speechTimeout: 'auto'
+    });
+    gather.say('I\'m sorry, I had trouble with that. Could you repeat what you said?');
   }
-  
+
   res.type('text/xml');
   res.send(twiml.toString());
 });
 
-// Status callback handler
+// Status callback handler — clean up conversation history when call ends
 app.post('/status-callback', (req, res) => {
-  console.log('Call status:', req.body.CallStatus);
+  const callSid = req.body.CallSid;
+  const callStatus = req.body.CallStatus;
+  console.log(`Call status for ${callSid}: ${callStatus}`);
+
+  if (callStatus === 'completed' || callStatus === 'failed' || callStatus === 'canceled' || callStatus === 'no-answer' || callStatus === 'busy') {
+    conversationHistory.delete(callSid);
+    console.log(`Session cleaned up for CallSid: ${callSid}`);
+  }
+
   res.sendStatus(200);
 });
 
